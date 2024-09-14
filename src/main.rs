@@ -6,21 +6,21 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Operation,
-
-    /// Set path to sing-box programm, using slash not back-slash
-    #[arg(short, long, name = "PROGRAM")]
-    exe: Option<String>,
-
-    /// Set working directory and config directory
-    #[arg(short, long, name = "WORKING DIR")]
-    dir: Option<String>,
 }
 
 #[derive(Subcommand)]
 enum Operation {
     /// Start sing-box
     #[command(name = "start")]
-    Start,
+    Start {
+        /// Path to sing-box programm
+        #[arg(short, long, name = "PROGRAM")]
+        bin: String,
+
+        /// Set config directory
+        #[arg(short, long, name = "CONFIG DIR")]
+        dir: String,
+    },
 
     /// Stop sing-box
     #[command(name = "stop")]
@@ -28,28 +28,49 @@ enum Operation {
 
     /// Restart sing-box
     #[command(name = "restart")]
-    Restart,
+    Restart {
+        /// Path to sing-box programm
+        #[arg(short, long, name = "PROGRAM")]
+        bin: String,
+
+        /// Set config directory
+        #[arg(short, long, name = "CONFIG DIR")]
+        dir: String,
+    },
+
+    /// Compile geosite.db categories to srs
+    ///
+    /// Read categories from config.json file located in same dir with geosite.db
+    ///
+    /// config.json structure: {"category":["abc","cde"]}
+    #[command(name = "compile")]
+    Compile {
+        /// File path to geosite.db
+        #[arg(short, long)]
+        file: String,
+
+        /// Path to sing-box program
+        #[arg(short, long, name = "PROGRAM")]
+        bin: String,
+    },
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let sing_path = PathBuf::from(
-        cli.exe
-            .unwrap_or("d:/Applications/sing-box/sing-box.exe".to_string()),
-    );
-    let working_dir = PathBuf::from(cli.dir.unwrap_or("d:/Applications/sing-box".to_string()));
-
-    if !sing_path.exists() {
-        eprintln!("Error: sing-box program path does not exist");
-        std::process::exit(-1);
-    } else if !working_dir.exists() {
-        eprintln!("Error: working directory does not exist");
-        std::process::exit(-2);
-    }
-
     match cli.command {
-        Operation::Start => {
+        Operation::Start { bin, dir } => {
+            let sing_path = PathBuf::from(bin);
+            let working_dir = PathBuf::from(dir);
+
+            if !sing_path.exists() {
+                eprintln!("Error: sing-box program path does not exist");
+                std::process::exit(-1);
+            } else if !working_dir.exists() {
+                eprintln!("Error: working directory does not exist");
+                std::process::exit(-1);
+            }
+
             let output = create_orphan_process(
                 sing_path.display().to_string().as_str(),
                 &[
@@ -78,7 +99,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error: {}", String::from_utf8_lossy(&output.stderr));
             }
         }
-        Operation::Restart => {
+        Operation::Restart { bin, dir } => {
+            let sing_path = PathBuf::from(bin);
+            let working_dir = PathBuf::from(dir);
+
+            if !sing_path.exists() {
+                eprintln!("Error: sing-box program path does not exist");
+                std::process::exit(-1);
+            } else if !working_dir.exists() {
+                eprintln!("Error: working directory does not exist");
+                std::process::exit(-1);
+            }
+
             let _ = std::process::Command::new("taskkill")
                 .args(["/F", "/IM", "sing-box*"])
                 .output()?;
@@ -95,9 +127,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             if output.is_ok() {
-                println!("sing-box successfully started");
+                println!("sing-box successfully restarted");
             } else {
                 eprintln!("Error: {}", output.err().unwrap());
+            }
+        }
+        Operation::Compile { file, bin } => {
+            let output = compile_binary(bin.as_str(), file.as_str());
+
+            if output.is_err() {
+                eprintln!("Error: {}", output.err().unwrap())
             }
         }
     };
@@ -157,31 +196,119 @@ fn create_orphan_process(program: &str, args: &[&str]) -> std::io::Result<()> {
     }
 }
 
-#[cfg(target_family = "unix")]
-fn create_orphan_process(program: &str, args: &[&str]) -> std::io::Result<()> {
-    use nix::unistd::{fork, ForkResult};
-    use std::os::unix::process::CommandExt;
+// #[cfg(target_family = "unix")]
+// fn create_orphan_process(program: &str, args: &[&str]) -> std::io::Result<()> {
+//     use nix::unistd::{fork, ForkResult};
+//     use std::os::unix::process::CommandExt;
 
-    match unsafe { fork() } {
-        Ok(ForkResult::Parent { child: _ }) => {
-            // 父进程立即退出
-            std::process::exit(0);
-        }
-        Ok(ForkResult::Child) => {
-            // 子进程
-            match unsafe { fork() } {
-                Ok(ForkResult::Parent { child: _ }) => {
-                    // 第一个子进程退出
-                    std::process::exit(0);
+//     match unsafe { fork() } {
+//         Ok(ForkResult::Parent { child: _ }) => {
+//             // 父进程立即退出
+//             std::process::exit(0);
+//         }
+//         Ok(ForkResult::Child) => {
+//             // 子进程
+//             match unsafe { fork() } {
+//                 Ok(ForkResult::Parent { child: _ }) => {
+//                     // 第一个子进程退出
+//                     std::process::exit(0);
+//                 }
+//                 Ok(ForkResult::Child) => {
+//                     // 孙进程（现在是孤儿进程）执行新程序
+//                     Command::new(program).args(args).exec();
+//                     unreachable!();
+//                 }
+//                 Err(_) => std::process::exit(1),
+//             }
+//         }
+//         Err(_) => std::process::exit(1),
+//     }
+// }
+
+fn compile_binary(bin: &str, file: &str) -> std::io::Result<()> {
+    use serde_json::Value;
+    use std::fs::File;
+    use std::io::Read;
+    use std::process::Command;
+
+    if !PathBuf::from(bin).exists() {
+        eprintln!("sing-box program path does not exist");
+        std::process::exit(-1);
+    }
+
+    // 读取config.json文件
+    let config_file = PathBuf::from(file).parent().unwrap().join("config.json");
+    let mut config_file = File::open(config_file)?;
+    let mut contents = String::new();
+    config_file.read_to_string(&mut contents)?;
+
+    // 解析JSON内容
+    let json: Value = serde_json::from_str(&contents)?;
+
+    // 提取category数组
+    if let Some(categories) = json["category"].as_array() {
+        for category in categories {
+            if let Some(item) = category.as_str() {
+                // 执行sing-box命令
+                let output = Command::new(bin)
+                    .args([
+                        "geosite",
+                        "export",
+                        item,
+                        "-f",
+                        file,
+                        "-o",
+                        PathBuf::from(file)
+                            .parent()
+                            .unwrap()
+                            .join(format!("geosite-{}.json", item))
+                            .display()
+                            .to_string()
+                            .as_str(),
+                        "-D",
+                        PathBuf::from(file)
+                            .parent()
+                            .unwrap()
+                            .display()
+                            .to_string()
+                            .as_str(),
+                    ])
+                    .output()?;
+
+                if output.status.success() {
+                    println!("Successfully exported {}", item);
+                } else {
+                    eprintln!("Failed to export {}", item);
+                    eprintln!("Error: {}", String::from_utf8_lossy(&output.stderr));
                 }
-                Ok(ForkResult::Child) => {
-                    // 孙进程（现在是孤儿进程）执行新程序
-                    Command::new(program).args(args).exec();
-                    unreachable!();
+
+                let category_path = format!("geosite-{}.json", item);
+                let output = Command::new(bin)
+                    .args([
+                        "rule-set",
+                        "compile",
+                        category_path.as_str(),
+                        "-D",
+                        PathBuf::from(file)
+                            .parent()
+                            .unwrap()
+                            .display()
+                            .to_string()
+                            .as_str(),
+                    ])
+                    .output()?;
+
+                if output.status.success() {
+                    println!("Successfully compiled {}", item);
+                } else {
+                    eprintln!("Failed to compile {}", item);
+                    eprintln!("Error: {}", String::from_utf8_lossy(&output.stderr));
                 }
-                Err(_) => std::process::exit(1),
             }
         }
-        Err(_) => std::process::exit(1),
+    } else {
+        eprintln!("No valid category array found in config.json");
     }
+
+    Ok(())
 }
